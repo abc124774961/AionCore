@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::Mutex;
+use subtle::ConstantTimeEq;
+use tokio::sync::{Mutex, watch};
 
 type Result<T> = std::result::Result<T, TokenBitsError>;
 
@@ -34,6 +35,26 @@ struct PendingAuthorization {
     expires_at: i64,
     interval: u64,
     next_poll_at: i64,
+}
+
+struct PendingBrowserAuthorization {
+    response: TokenBitsBrowserAuthorization,
+    client_id: String,
+    device_name: String,
+    state: String,
+    verifier: String,
+    redirect_uri: String,
+    binding_hash: Option<[u8; 32]>,
+    completed_code_hash: Option<[u8; 32]>,
+    completed_device_id: Option<i64>,
+    close_listener: watch::Sender<bool>,
+}
+
+/// New flows return a listener lifetime receiver; reused flows do not start another listener.
+pub struct BrowserAuthorizationStart {
+    pub authorization: TokenBitsBrowserAuthorization,
+    pub binding_cookie: Option<String>,
+    pub listener_shutdown: Option<watch::Receiver<bool>>,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +92,7 @@ pub struct TokenBitsService {
     client: TokenBitsClient,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pending: Mutex<HashMap<String, PendingAuthorization>>,
+    browser_pending: Mutex<HashMap<String, PendingBrowserAuthorization>>,
 }
 
 impl TokenBitsService {
@@ -81,6 +103,7 @@ impl TokenBitsService {
             client,
             locks: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            browser_pending: Mutex::new(HashMap::new()),
         }
     }
 
@@ -116,6 +139,7 @@ impl TokenBitsService {
                 .as_ref()
                 .is_some_and(|s| s.needs_reauthorization || s.issuer != self.client.issuer()),
             issuer: self.client.issuer(),
+            browser_origin: self.client.browser_origin(),
             device_id: state.as_ref().map(|s| s.device_id),
             account: state.as_ref().and_then(|s| s.account.clone()),
             last_sync_at: state.and_then(|s| s.last_sync_at),
@@ -132,6 +156,15 @@ impl TokenBitsService {
         }
         let lock = self.lock(user).await;
         let _guard = lock.lock().await;
+        if self
+            .browser_pending
+            .lock()
+            .await
+            .get(user)
+            .is_some_and(|p| p.response.expires_at > now())
+        {
+            return Err(TokenBitsError::Remote("authorization_conflict"));
+        }
         if self.load(user).await?.is_some_and(|s| !s.needs_reauthorization) {
             return Err(TokenBitsError::Remote("already_connected"));
         }
@@ -172,6 +205,211 @@ impl TokenBitsService {
         );
         tracing::info!("TokenBits device authorization started");
         Ok(response)
+    }
+
+    /// Create a proof-bound front-channel flow. HTTP handlers own any listener.
+    pub async fn start_browser_authorization(
+        &self,
+        user: &str,
+        req: TokenBitsBrowserAuthorizeRequest,
+        browser_cookie: Option<&str>,
+    ) -> Result<BrowserAuthorizationStart> {
+        if !matches!(req.client_id.as_str(), "aionui-desktop" | "aionui-web")
+            || req.device_name.trim().is_empty()
+            || req.device_name.len() > 128
+            || req.device_name.chars().any(char::is_control)
+        {
+            return Err(TokenBitsError::InvalidRequest);
+        }
+        let redirect_uri = req.redirect_uri.ok_or(TokenBitsError::InvalidRequest)?;
+        validate_browser_redirect(&req.client_id, &redirect_uri)?;
+        let lock = self.lock(user).await;
+        let _guard = lock.lock().await;
+        if self.load(user).await?.is_some_and(|s| !s.needs_reauthorization) {
+            return Err(TokenBitsError::Remote("already_connected"));
+        }
+        let mut pending = self.browser_pending.lock().await;
+        pending.retain(|_, flow| {
+            let active = flow.response.expires_at > now();
+            if !active {
+                let _ = flow.close_listener.send(true);
+            }
+            active
+        });
+        if let Some(existing) = pending.get(user) {
+            if existing.client_id != req.client_id
+                || existing.device_name != req.device_name
+                || (existing.client_id == "aionui-web" && existing.redirect_uri != redirect_uri)
+            {
+                return Err(TokenBitsError::Remote("authorization_conflict"));
+            }
+            verify_browser_binding(existing.binding_hash, browser_cookie)?;
+            return Ok(BrowserAuthorizationStart {
+                authorization: existing.response.clone(),
+                binding_cookie: None,
+                listener_shutdown: None,
+            });
+        }
+        let state = random_secret()?;
+        let verifier = random_secret()?;
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let (binding_cookie, binding_hash) = if req.client_id == "aionui-web" {
+            let value = random_secret()?;
+            let hash = digest_secret(&value);
+            (Some(value), Some(hash))
+        } else {
+            (None, None)
+        };
+        let authorization = TokenBitsBrowserAuthorization {
+            flow_id: random_secret()?,
+            authorization_url: self.client.browser_authorization_url(
+                &req.client_id,
+                &req.device_name,
+                &redirect_uri,
+                &state,
+                &challenge,
+            )?,
+            expires_at: now() + 600,
+            mode: if req.client_id == "aionui-desktop" {
+                "desktop"
+            } else {
+                "web"
+            }
+            .into(),
+        };
+        let (close_listener, listener_shutdown) = watch::channel(false);
+        pending.insert(
+            user.into(),
+            PendingBrowserAuthorization {
+                response: authorization.clone(),
+                client_id: req.client_id,
+                device_name: req.device_name,
+                state,
+                verifier,
+                redirect_uri,
+                binding_hash,
+                completed_code_hash: None,
+                completed_device_id: None,
+                close_listener,
+            },
+        );
+        // A previous device-code flow cannot race this connection.
+        self.pending.lock().await.remove(user);
+        tracing::info!(mode = %authorization.mode, "TokenBits browser authorization started");
+        Ok(BrowserAuthorizationStart {
+            authorization,
+            binding_cookie,
+            listener_shutdown: Some(listener_shutdown),
+        })
+    }
+
+    pub async fn browser_authorization_status(&self, user: &str, flow_id: &str) -> Result<TokenBitsPollResponse> {
+        let pending = self.browser_pending.lock().await;
+        let flow = pending
+            .get(user)
+            .filter(|flow| flow.response.flow_id == flow_id)
+            .ok_or(TokenBitsError::NotFound)?;
+        let status = if flow.response.expires_at <= now() {
+            "expired"
+        } else if flow.completed_device_id.is_some() {
+            "authorized"
+        } else {
+            "pending"
+        };
+        Ok(poll_response(status, 2))
+    }
+
+    pub async fn complete_browser_authorization(
+        &self,
+        user: &str,
+        req: TokenBitsBrowserCompleteRequest,
+        browser_cookie: Option<&str>,
+    ) -> Result<TokenBitsPollResponse> {
+        let lock = self.lock(user).await;
+        let _guard = lock.lock().await;
+        let (client_id, verifier, redirect_uri, code_hash) = {
+            let pending = self.browser_pending.lock().await;
+            let flow = pending
+                .get(user)
+                .filter(|flow| flow.response.flow_id == req.flow_id)
+                .ok_or(TokenBitsError::NotFound)?;
+            if flow.response.expires_at <= now() {
+                return Err(TokenBitsError::Remote("expired_token"));
+            }
+            if !bool::from(flow.state.as_bytes().ct_eq(req.state.as_bytes()))
+                || !req.code.starts_with("wb_bc_")
+                || req.code.len() != 54
+                || !req
+                    .code
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            {
+                return Err(TokenBitsError::InvalidRequest);
+            }
+            verify_browser_binding(flow.binding_hash, browser_cookie)?;
+            let code_hash = digest_secret(&req.code);
+            if flow.completed_code_hash.is_some_and(|known| known != code_hash) {
+                return Err(TokenBitsError::InvalidRequest);
+            }
+            if flow.completed_device_id.is_some() {
+                return Ok(poll_response("authorized", 2));
+            }
+            (
+                flow.client_id.clone(),
+                flow.verifier.clone(),
+                flow.redirect_uri.clone(),
+                code_hash,
+            )
+        };
+        let token: RemoteToken = self
+            .client
+            .request(
+                Method::POST,
+                "/token",
+                None,
+                Some(json!({
+                    "grant_type":"authorization_code", "client_id":client_id, "code":req.code,
+                    "code_verifier":verifier, "redirect_uri":redirect_uri, "exchange_id":req.flow_id
+                })),
+            )
+            .await?;
+        validate_token(&token)?;
+        let account = StoredAccount {
+            issuer: self.client.issuer(),
+            client_id,
+            access_token: token.access_token,
+            refresh_token: token.refresh_token,
+            device_id: token.device_id,
+            expires_at: now() + token.expires_in,
+            exchange_id: random_secret()?,
+            account: None,
+            last_sync_at: None,
+            needs_reauthorization: false,
+        };
+        self.save(user, &account).await?;
+        let mut pending = self.browser_pending.lock().await;
+        let flow = pending
+            .get_mut(user)
+            .filter(|flow| flow.response.flow_id == req.flow_id)
+            .ok_or(TokenBitsError::NotFound)?;
+        flow.completed_code_hash = Some(code_hash);
+        flow.completed_device_id = Some(account.device_id);
+        let _ = flow.close_listener.send(true);
+        tracing::info!("TokenBits browser authorization completed");
+        Ok(poll_response("authorized", 2))
+    }
+
+    pub async fn cancel_browser_authorization(&self, user: &str, flow_id: &str) -> Result<()> {
+        let lock = self.lock(user).await;
+        let _guard = lock.lock().await;
+        let mut pending = self.browser_pending.lock().await;
+        if pending.get(user).is_none_or(|flow| flow.response.flow_id != flow_id) {
+            return Err(TokenBitsError::NotFound);
+        }
+        if let Some(flow) = pending.remove(user) {
+            let _ = flow.close_listener.send(true);
+        }
+        Ok(())
     }
 
     pub async fn cancel(&self, user: &str, flow_id: &str) -> Result<()> {
@@ -443,6 +681,9 @@ impl TokenBitsService {
         let lock = self.lock(user).await;
         let _guard = lock.lock().await;
         self.pending.lock().await.remove(user);
+        if let Some(flow) = self.browser_pending.lock().await.remove(user) {
+            let _ = flow.close_listener.send(true);
+        }
         if let Some(original) = self.load(user).await? {
             if original.issuer != self.client.issuer() {
                 return Err(TokenBitsError::RevocationUnconfirmed);
@@ -470,6 +711,44 @@ impl TokenBitsService {
     }
 }
 
+fn digest_secret(value: &str) -> [u8; 32] {
+    Sha256::digest(value.as_bytes()).into()
+}
+fn verify_browser_binding(expected: Option<[u8; 32]>, provided: Option<&str>) -> Result<()> {
+    match expected {
+        Some(expected) if !provided.is_some_and(|value| bool::from(expected.ct_eq(&digest_secret(value)))) => {
+            Err(TokenBitsError::BrowserBinding)
+        }
+        None if provided.is_some() => Err(TokenBitsError::BrowserBinding),
+        _ => Ok(()),
+    }
+}
+fn validate_browser_redirect(client_id: &str, value: &str) -> Result<()> {
+    let url = reqwest::Url::parse(value).map_err(|_| TokenBitsError::InvalidRequest)?;
+    if value.len() > 2048
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/tokenbits/callback"
+        || url.host_str().is_none()
+        || url.port() == Some(0)
+    {
+        return Err(TokenBitsError::InvalidRequest);
+    }
+    let allowed = if client_id == "aionui-desktop" {
+        url.scheme() == "http" && url.host_str() == Some("127.0.0.1") && url.port().is_some()
+    } else {
+        url.scheme() == "https"
+            || url.scheme() == "http" && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(TokenBitsError::InvalidRequest)
+    }
+}
+
 fn now() -> i64 {
     aionui_common::now_ms() / 1000
 }
@@ -493,5 +772,61 @@ fn poll_response(status: &str, interval: u64) -> TokenBitsPollResponse {
     TokenBitsPollResponse {
         status: status.into(),
         interval,
+    }
+}
+
+#[cfg(test)]
+mod browser_expiry_tests {
+    use super::*;
+    use aionui_db::{SqliteTokenBitsRepository, init_database_memory};
+
+    #[tokio::test]
+    async fn expired_flow_is_not_exchanged_and_can_be_restarted() {
+        let db = init_database_memory().await.unwrap();
+        let service = TokenBitsService::new(
+            Arc::new(SqliteTokenBitsRepository::new(db.pool().clone())),
+            [42; 32],
+            TokenBitsClient::new("http://127.0.0.1:1").unwrap(),
+        );
+        let request = || TokenBitsBrowserAuthorizeRequest {
+            client_id: "aionui-web".into(),
+            device_name: "Expiry fixture".into(),
+            redirect_uri: Some("https://web.example/tokenbits/callback".into()),
+        };
+        let started = service
+            .start_browser_authorization("system_default_user", request(), None)
+            .await
+            .unwrap();
+        let state = {
+            let mut pending = service.browser_pending.lock().await;
+            let flow = pending.get_mut("system_default_user").unwrap();
+            flow.response.expires_at = now() - 1;
+            flow.state.clone()
+        };
+        assert_eq!(
+            service
+                .browser_authorization_status("system_default_user", &started.authorization.flow_id)
+                .await
+                .unwrap()
+                .status,
+            "expired"
+        );
+        let error = service
+            .complete_browser_authorization(
+                "system_default_user",
+                TokenBitsBrowserCompleteRequest {
+                    flow_id: started.authorization.flow_id.clone(),
+                    code: format!("wb_bc_{}", "x".repeat(48)),
+                    state,
+                },
+                started.binding_cookie.as_deref(),
+            )
+            .await;
+        assert!(matches!(error, Err(TokenBitsError::Remote("expired_token"))));
+        let restarted = service
+            .start_browser_authorization("system_default_user", request(), None)
+            .await
+            .unwrap();
+        assert_ne!(started.authorization.flow_id, restarted.authorization.flow_id);
     }
 }

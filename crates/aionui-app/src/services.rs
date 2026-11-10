@@ -253,8 +253,11 @@ impl AppServices {
 
         let tokenbits_issuer = std::env::var("AIONUI_TOKENBITS_ISSUER")
             .unwrap_or_else(|_| aionui_tokenbits::client::DEFAULT_ISSUER.into());
-        let tokenbits_client = aionui_tokenbits::client::TokenBitsClient::new(&tokenbits_issuer)
-            .map_err(|_| anyhow::anyhow!("Invalid TokenBits issuer configuration"))?;
+        let tokenbits_client = match std::env::var("AIONUI_TOKENBITS_BROWSER_ORIGIN") {
+            Ok(origin) => aionui_tokenbits::client::TokenBitsClient::with_browser_origin(&tokenbits_issuer, &origin),
+            Err(_) => aionui_tokenbits::client::TokenBitsClient::new(&tokenbits_issuer),
+        }
+        .map_err(|_| anyhow::anyhow!("Invalid TokenBits issuer configuration"))?;
         let tokenbits_service = Arc::new(aionui_tokenbits::service::TokenBitsService::new(
             Arc::new(aionui_db::SqliteTokenBitsRepository::new(database.pool().clone())),
             encryption_key,
