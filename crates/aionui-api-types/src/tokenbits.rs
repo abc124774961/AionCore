@@ -11,6 +11,7 @@ pub struct TokenBitsStatus {
     pub connected: bool,
     pub needs_reauthorization: bool,
     pub issuer: String,
+    pub browser_origin: String,
     pub device_id: Option<i64>,
     pub account: Option<TokenBitsAccountIdentity>,
     pub last_sync_at: Option<i64>,
@@ -38,6 +39,32 @@ pub struct TokenBitsAuthorization {
 pub struct TokenBitsPollResponse {
     pub status: String,
     pub interval: u64,
+}
+
+/// Browser authorization keeps proof keys and long-lived credentials in Core.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenBitsBrowserAuthorizeRequest {
+    pub client_id: String,
+    pub device_name: String,
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct TokenBitsBrowserAuthorization {
+    pub flow_id: String,
+    pub authorization_url: String,
+    pub expires_at: i64,
+    pub mode: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenBitsBrowserCompleteRequest {
+    pub flow_id: String,
+    pub code: String,
+    pub state: String,
 }
 
 #[derive(Deserialize, Serialize)]

@@ -5,10 +5,10 @@ use aionui_auth::{CurrentUser, RateLimiter, authenticated_action_rate_limit_midd
 use aionui_common::ApiError;
 use axum::{
     Extension, Json, Router,
-    extract::{Path, Request, State, rejection::JsonRejection},
-    http::{HeaderValue, StatusCode},
+    extract::{Path, Query, Request, State, rejection::JsonRejection},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
-    response::Response,
+    response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
 };
 use std::{sync::Arc, time::Duration};
@@ -18,6 +18,7 @@ impl From<TokenBitsError> for ApiError {
     fn from(error: TokenBitsError) -> Self {
         let (status, code) = match &error {
             TokenBitsError::InvalidRequest => (StatusCode::BAD_REQUEST, "TOKENBITS_INVALID_REQUEST"),
+            TokenBitsError::BrowserBinding => (StatusCode::FORBIDDEN, "TOKENBITS_BROWSER_BINDING"),
             TokenBitsError::NotFound => (StatusCode::NOT_FOUND, "TOKENBITS_NOT_FOUND"),
             TokenBitsError::Reauthorization => (StatusCode::CONFLICT, "TOKENBITS_REAUTHORIZE"),
             TokenBitsError::DeviceRevoked => (StatusCode::CONFLICT, "TOKENBITS_REAUTHORIZE"),
@@ -37,6 +38,18 @@ pub fn domain_routes(state: TokenBitsRouterState) -> Router {
     Router::new()
         .route("/api/integrations/tokenbits/status", get(status))
         .route("/api/integrations/tokenbits/device-authorizations", post(authorize))
+        .route(
+            "/api/integrations/tokenbits/browser-authorizations",
+            post(browser_authorize),
+        )
+        .route(
+            "/api/integrations/tokenbits/browser-authorizations/complete",
+            post(browser_complete),
+        )
+        .route(
+            "/api/integrations/tokenbits/browser-authorizations/{id}",
+            get(browser_status).delete(browser_cancel),
+        )
         .route(
             "/api/integrations/tokenbits/device-authorizations/{id}/poll",
             post(poll),
@@ -182,4 +195,222 @@ pub async fn no_store(request: Request, next: Next) -> Response {
             .insert("cache-control", HeaderValue::from_static("no-store"));
     }
     response
+}
+
+const BROWSER_COOKIE: &str = "aionui-tokenbits-browser";
+const BROWSER_COOKIE_PATH: &str = "/api/integrations/tokenbits/browser-authorizations";
+
+fn browser_cookie(value: &str, secure: bool, clear: bool) -> Result<HeaderValue, ApiError> {
+    HeaderValue::from_str(&format!(
+        "{BROWSER_COOKIE}={value}; Path={BROWSER_COOKIE_PATH}; HttpOnly; SameSite=Strict{}; Max-Age={}",
+        if secure { "; Secure" } else { "" },
+        if clear { 0 } else { 600 },
+    ))
+    .map_err(|_| TokenBitsError::Unavailable.into())
+}
+
+async fn browser_authorize(
+    State(s): State<TokenBitsRouterState>,
+    Extension(u): Extension<CurrentUser>,
+    headers: HeaderMap,
+    body: Result<Json<TokenBitsBrowserAuthorizeRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(mut req) = body.map_err(ApiError::from)?;
+    let mut listener = None;
+    let secure;
+    if s.local {
+        if req.client_id != "aionui-desktop" || req.redirect_uri.is_some() {
+            return Err(TokenBitsError::InvalidRequest.into());
+        }
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|_| TokenBitsError::Unavailable)?;
+        let address = socket.local_addr().map_err(|_| TokenBitsError::Unavailable)?;
+        req.redirect_uri = Some(format!("http://{address}/tokenbits/callback"));
+        listener = Some(socket);
+        secure = false;
+    } else {
+        if req.client_id != "aionui-web" {
+            return Err(TokenBitsError::InvalidRequest.into());
+        }
+        let redirect = req.redirect_uri.as_deref().ok_or(TokenBitsError::InvalidRequest)?;
+        let url = reqwest::Url::parse(redirect).map_err(|_| TokenBitsError::InvalidRequest)?;
+        if headers.get(header::ORIGIN).and_then(|value| value.to_str().ok())
+            != Some(url.origin().ascii_serialization().as_str())
+        {
+            return Err(TokenBitsError::BrowserBinding.into());
+        }
+        secure = url.scheme() == "https";
+    }
+    let binding = if s.local {
+        None
+    } else {
+        aionui_auth::extract_cookie_value(&headers, BROWSER_COOKIE)
+    };
+    let result = s
+        .service
+        .start_browser_authorization(&u.id, req, binding.as_deref())
+        .await?;
+    if let (Some(listener), Some(shutdown)) = (listener, result.listener_shutdown) {
+        launch_desktop_callback(
+            listener,
+            s.service.clone(),
+            u.id,
+            result.authorization.flow_id.clone(),
+            result.authorization.expires_at,
+            shutdown,
+        )?;
+    }
+    let mut response = Json(ApiResponse::ok(result.authorization)).into_response();
+    if let Some(value) = result.binding_cookie {
+        response
+            .headers_mut()
+            .insert(header::SET_COOKIE, browser_cookie(&value, secure, false)?);
+    }
+    Ok(response)
+}
+
+async fn browser_complete(
+    State(s): State<TokenBitsRouterState>,
+    Extension(u): Extension<CurrentUser>,
+    headers: HeaderMap,
+    body: Result<Json<TokenBitsBrowserCompleteRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    if s.local {
+        return Err(TokenBitsError::InvalidRequest.into());
+    }
+    let Json(req) = body.map_err(ApiError::from)?;
+    let binding = aionui_auth::extract_cookie_value(&headers, BROWSER_COOKIE);
+    let result = s
+        .service
+        .complete_browser_authorization(&u.id, req, binding.as_deref())
+        .await?;
+    let mut response = Json(ApiResponse::ok(result)).into_response();
+    let secure = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|origin| origin.starts_with("https://"));
+    response
+        .headers_mut()
+        .insert(header::SET_COOKIE, browser_cookie("", secure, true)?);
+    Ok(response)
+}
+
+async fn browser_status(
+    State(s): State<TokenBitsRouterState>,
+    Extension(u): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<TokenBitsPollResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        s.service.browser_authorization_status(&u.id, &id).await?,
+    )))
+}
+
+async fn browser_cancel(
+    State(s): State<TokenBitsRouterState>,
+    Extension(u): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    s.service.cancel_browser_authorization(&u.id, &id).await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+#[derive(Clone)]
+struct DesktopCallbackState {
+    service: Arc<crate::service::TokenBitsService>,
+    user: String,
+    flow_id: String,
+    host: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DesktopCallbackQuery {
+    code: String,
+    state: String,
+}
+
+fn launch_desktop_callback(
+    listener: tokio::net::TcpListener,
+    service: Arc<crate::service::TokenBitsService>,
+    user: String,
+    flow_id: String,
+    expires_at: i64,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), ApiError> {
+    let host = listener
+        .local_addr()
+        .map_err(|_| TokenBitsError::Unavailable)?
+        .to_string();
+    let router = Router::new()
+        .route("/tokenbits/callback", get(desktop_callback))
+        .with_state(DesktopCallbackState {
+            service,
+            user,
+            flow_id,
+            host,
+        })
+        .layer(middleware::from_fn(|request: Request, next: Next| async move {
+            let mut response = next.run(request).await;
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+                .headers_mut()
+                .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+            response.headers_mut().insert(
+                "content-security-policy",
+                HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+            );
+            response
+        }));
+    let remaining = (expires_at - aionui_common::now_ms() / 1000).max(0) as u64;
+    tokio::spawn(async move {
+        // No tracing layer here: callback URLs contain a short-lived authorization code.
+        let result = axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(remaining)) => {},
+                    _ = async { while !*shutdown.borrow() { if shutdown.changed().await.is_err() { break; } } } => {},
+                }
+            })
+            .await;
+        if result.is_err() {
+            tracing::warn!("TokenBits callback listener stopped with an IO error");
+        }
+    });
+    Ok(())
+}
+
+async fn desktop_callback(
+    State(state): State<DesktopCallbackState>,
+    headers: HeaderMap,
+    query: Result<Query<DesktopCallbackQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    if headers.get(header::HOST).and_then(|value| value.to_str().ok()) != Some(state.host.as_str()) {
+        return (StatusCode::BAD_REQUEST, Html("Invalid connection callback.")).into_response();
+    }
+    let Ok(Query(query)) = query else {
+        return (StatusCode::BAD_REQUEST, Html("Invalid connection callback.")).into_response();
+    };
+    let result = state
+        .service
+        .complete_browser_authorization(
+            &state.user,
+            TokenBitsBrowserCompleteRequest {
+                flow_id: state.flow_id,
+                code: query.code,
+                state: query.state,
+            },
+            None,
+        )
+        .await;
+    match result {
+        Ok(_) => Html("Connected to TokenBits. You can return to AionUi.").into_response(),
+        Err(_) => (
+            StatusCode::BAD_REQUEST,
+            Html("Connection could not be completed. Return to AionUi to retry."),
+        )
+            .into_response(),
+    }
 }
