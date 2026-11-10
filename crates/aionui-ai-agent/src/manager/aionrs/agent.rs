@@ -103,7 +103,10 @@ fn build_aionrs_final_input_dump_value(
     })
 }
 
+type ManagedProviderGuard = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), AgentError>> + Send>> + Send + Sync>;
+
 pub struct AionrsAgentManager {
+    managed_provider_guard: Option<ManagedProviderGuard>,
     runtime: AgentRuntime,
     engine: Mutex<AgentEngine>,
     /// Static slash command metadata captured at bootstrap so UI lookups do
@@ -137,6 +140,12 @@ impl Drop for AionrsAgentManager {
 }
 
 impl AionrsAgentManager {
+    /// Re-check managed credentials before every turn, including cached runtimes.
+    pub fn with_managed_provider_guard(mut self, guard: ManagedProviderGuard) -> Self {
+        self.managed_provider_guard = Some(guard);
+        self
+    }
+
     pub async fn new(
         conversation_id: String,
         workspace: String,
@@ -282,6 +291,7 @@ impl AionrsAgentManager {
             approval_manager,
             confirmations,
             final_input_dump,
+            managed_provider_guard: None,
             cancel_notify: Arc::new(Notify::new()),
             turn_finished_notify: Arc::new(Notify::new()),
         })
@@ -383,6 +393,11 @@ impl IAgentTask for AionrsAgentManager {
     }
 
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        if let Some(guard) = &self.managed_provider_guard {
+            guard()
+                .await
+                .map_err(|error| AgentSendError::from_agent_error_ref_for_backend(&error, Some("aionrs")))?;
+        }
         let started_at = now_ms();
         info!(
             conversation_id = %self.runtime.conversation_id(),

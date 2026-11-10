@@ -276,6 +276,22 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         })),
     };
 
+    // Account integration controls are not accessible with conversation helper tokens.
+    let tokenbits_auth_state = AuthState {
+        jwt_service: services.jwt_service.clone(),
+        user_repo: services.user_repo.clone(),
+        identity_mode: auth_identity_mode(services.identity_mode),
+        runtime_token_verifier: None,
+    };
+    let tokenbits_authenticated =
+        aionui_tokenbits::routes::domain_routes(aionui_tokenbits::state::TokenBitsRouterState {
+            service: services.tokenbits_service.clone(),
+            local: services.identity_mode.is_local(),
+            local_secret: std::env::var("AIONUI_TOKENBITS_LOCAL_SECRET").ok(),
+        })
+        .route_layer(from_fn_with_state(tokenbits_auth_state, auth_middleware))
+        .layer(middleware::from_fn(aionui_tokenbits::routes::no_store));
+
     // System routes protected by auth middleware
     let system_authenticated =
         system_routes(states.system).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -400,6 +416,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .route("/health", get(health_check))
         .merge(auth_routes(auth_state))
         .merge(system_authenticated)
+        .merge(tokenbits_authenticated)
         .merge(conversation_authenticated)
         .merge(conversation_ops_authenticated)
         .merge(remote_agent_authenticated)
@@ -447,6 +464,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let router = router.layer(DefaultBodyLimit::max(aionui_common::constants::BODY_LIMIT));
     let router = router.layer(middleware::from_fn(normalize_boundary_error_response));
 
+    let router = router.layer(middleware::from_fn(aionui_tokenbits::routes::no_store));
     let router = with_access_log(router);
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -488,6 +506,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
                 header::CONTENT_TYPE,
                 header::AUTHORIZATION,
                 HeaderName::from_static("x-csrf-token"),
+                HeaderName::from_static("x-aionui-integration"),
             ]);
         router.layer(cors)
     }

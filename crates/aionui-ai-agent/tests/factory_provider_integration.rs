@@ -199,3 +199,57 @@ async fn aionrs_factory_respects_use_model_override() {
     let result = factory(options).await;
     assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokenbits_cached_runtime_rejects_new_turn_after_local_disable() {
+    use aionui_db::{ITokenBitsRepository, ManagedProviderInput, SqliteTokenBitsRepository};
+    let db = init_database_memory().await.unwrap();
+    let pool = db.pool().clone();
+    let managed = SqliteTokenBitsRepository::new(pool.clone());
+    let encrypted = encrypt_string("sk-tokenbits-test", &test_encryption_key()).unwrap();
+    let id = managed
+        .upsert_provider(ManagedProviderInput {
+            user_id: TEST_USER_ID,
+            connection_id: "7",
+            group: "default",
+            model: "gpt-4o",
+            base_url: "https://api.tokenbits.net/v1",
+            encrypted_key: &encrypted,
+        })
+        .await
+        .unwrap();
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
+    let registry = AgentRegistry::new(Arc::new(SqliteAgentMetadataRepository::new(pool.clone())));
+    registry.hydrate().await.unwrap();
+    let session_repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(pool));
+    let factory = make_factory(provider_repo, registry, AcpSessionSyncService::new(session_repo));
+    let options = make_aionrs_options(
+        "tokenbits-guard-test",
+        "/tmp/test-workspace",
+        ProviderWithModel {
+            provider_id: id,
+            model: "gpt-4o".into(),
+            use_model: None,
+        },
+        AionrsBuildExtra::default(),
+    );
+    let agent = factory(options).await.unwrap();
+    managed.disable_providers(TEST_USER_ID).await.unwrap();
+    let err = agent
+        .send_message(aionui_ai_agent::types::SendMessageData {
+            content: "This must not reach a provider".into(),
+            msg_id: "guard-check".into(),
+            turn_id: None,
+            files: vec![],
+            inject_skills: vec![],
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.stream_error()
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("TokenBits connection is disabled")
+    );
+}

@@ -13,6 +13,7 @@ members = [
     "crates/aionui-skill-runtime",
     "crates/aionui-auth",
     "crates/aionui-system",
+    "crates/aionui-tokenbits",
     "crates/aionui-file",
     "crates/aionui-office",
     "crates/aionui-shell",
@@ -49,6 +50,7 @@ aionui-session-message = { path = "crates/aionui-session-message" }
 aionui-skill-runtime = { path = "crates/aionui-skill-runtime" }
 aionui-auth = { path = "crates/aionui-auth" }
 aionui-system = { path = "crates/aionui-system" }
+aionui-tokenbits = { path = "crates/aionui-tokenbits" }
 aionui-file = { path = "crates/aionui-file" }
 aionui-office = { path = "crates/aionui-office" }
 aionui-shell = { path = "crates/aionui-shell" }

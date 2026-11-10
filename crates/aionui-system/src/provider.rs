@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 
 use crate::error::SystemError;
 
-/// Business logic for model provider CRUD with API key encryption/masking.
+/// Provider CRUD: encrypt credentials and hide integration-managed keys.
 #[derive(Clone)]
 pub struct ProviderService {
     repo: Arc<dyn IProviderRepository>,
@@ -20,7 +20,7 @@ impl ProviderService {
         Self { repo, encryption_key }
     }
 
-    /// List all providers with masked API keys.
+    /// List providers; managed credentials never leave the backend.
     pub async fn list(&self, user_id: &str) -> Result<Vec<ProviderResponse>, SystemError> {
         let rows = self.repo.list(user_id).await?;
         rows.into_iter().map(|row| self.row_to_response(row)).collect()
@@ -75,6 +75,16 @@ impl ProviderService {
         id: &str,
         req: UpdateProviderRequest,
     ) -> Result<ProviderResponse, SystemError> {
+        let current = self
+            .repo
+            .find_by_id(user_id, id)
+            .await?
+            .ok_or_else(|| SystemError::NotFound("Provider not found".into()))?;
+        if current.credential_source == "tokenbits" {
+            return Err(SystemError::Conflict(
+                "TokenBits providers are managed by the integration".into(),
+            ));
+        }
         validate_update_request(&req)?;
 
         let encrypted_key = req
@@ -113,6 +123,16 @@ impl ProviderService {
 
     /// Delete a provider by ID.
     pub async fn delete(&self, user_id: &str, id: &str) -> Result<(), SystemError> {
+        let current = self
+            .repo
+            .find_by_id(user_id, id)
+            .await?
+            .ok_or_else(|| SystemError::NotFound("Provider not found".into()))?;
+        if current.credential_source == "tokenbits" {
+            return Err(SystemError::Conflict(
+                "Disconnect TokenBits through its integration settings".into(),
+            ));
+        }
         self.repo.delete(user_id, id).await?;
         Ok(())
     }
@@ -121,8 +141,7 @@ impl ProviderService {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Convert a DB row into a response DTO with the plaintext API key
-    /// (decrypted) and deserialized JSON fields.
+    /// Convert a row into a response; only manual provider keys are decrypted.
     ///
     /// Pre-launch: the response returns the API key in plaintext so the
     /// frontend can migrate its local store to the backend without losing
@@ -134,16 +153,20 @@ impl ProviderService {
         // provider list down. Surface the row with an empty api_key so the
         // user can see it and re-enter the key; log at warn for production
         // diagnosability.
-        let api_key = match decrypt_string(&row.api_key_encrypted, &self.encryption_key) {
-            Ok(key) => key,
-            Err(error) => {
-                tracing::warn!(
-                    provider_id = %row.id,
-                    provider_name = %row.name,
-                    %error,
-                    "provider api_key failed to decrypt; returning empty key so the row stays visible for re-entry"
-                );
-                String::new()
+        let api_key = if row.credential_source == "tokenbits" {
+            String::new()
+        } else {
+            match decrypt_string(&row.api_key_encrypted, &self.encryption_key) {
+                Ok(key) => key,
+                Err(error) => {
+                    tracing::warn!(
+                        provider_id = %row.id,
+                        provider_name = %row.name,
+                        %error,
+                        "provider api_key failed to decrypt; returning empty key so the row stays visible for re-entry"
+                    );
+                    String::new()
+                }
             }
         };
 
@@ -160,6 +183,7 @@ impl ProviderService {
         let bedrock_config = deserialize_opt(&row.bedrock_config, "bedrock_config")?;
 
         Ok(ProviderResponse {
+            credential_source: row.credential_source,
             id: row.id,
             platform: row.platform,
             name: row.name,
