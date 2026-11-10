@@ -157,6 +157,14 @@ impl TokenBitsService {
         let lock = self.lock(user).await;
         let _guard = lock.lock().await;
         if self
+            .load(user)
+            .await?
+            .is_some_and(|s| !s.needs_reauthorization && s.issuer == self.client.issuer())
+        {
+            return Err(TokenBitsError::Remote("already_connected"));
+        }
+        self.clear_completed_browser_flow(user).await;
+        if self
             .browser_pending
             .lock()
             .await
@@ -164,9 +172,6 @@ impl TokenBitsService {
             .is_some_and(|p| p.response.expires_at > now())
         {
             return Err(TokenBitsError::Remote("authorization_conflict"));
-        }
-        if self.load(user).await?.is_some_and(|s| !s.needs_reauthorization) {
-            return Err(TokenBitsError::Remote("already_connected"));
         }
         let verifier = random_secret()?;
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
@@ -225,9 +230,14 @@ impl TokenBitsService {
         validate_browser_redirect(&req.client_id, &redirect_uri)?;
         let lock = self.lock(user).await;
         let _guard = lock.lock().await;
-        if self.load(user).await?.is_some_and(|s| !s.needs_reauthorization) {
+        if self
+            .load(user)
+            .await?
+            .is_some_and(|s| !s.needs_reauthorization && s.issuer == self.client.issuer())
+        {
             return Err(TokenBitsError::Remote("already_connected"));
         }
+        self.clear_completed_browser_flow(user).await;
         let mut pending = self.browser_pending.lock().await;
         pending.retain(|_, flow| {
             let active = flow.response.expires_at > now();
@@ -317,6 +327,18 @@ impl TokenBitsService {
             "pending"
         };
         Ok(poll_response(status, 2))
+    }
+
+    // Called while the user's operation lock is held, only after confirming a
+    // new authorization is required. An old success receipt must never reuse a
+    // closed listener or cleared cookie for a revoked/changed issuer connection.
+    async fn clear_completed_browser_flow(&self, user: &str) {
+        let mut pending = self.browser_pending.lock().await;
+        if pending.get(user).is_some_and(|flow| flow.completed_device_id.is_some())
+            && let Some(flow) = pending.remove(user)
+        {
+            let _ = flow.close_listener.send(true);
+        }
     }
 
     pub async fn complete_browser_authorization(

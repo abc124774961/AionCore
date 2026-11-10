@@ -628,3 +628,108 @@ async fn desktop_cancel_closes_listener_without_authorizing() {
     }
     panic!("cancelled listener stayed open");
 }
+
+#[tokio::test]
+async fn revoked_connection_gets_fresh_web_proof_cookie_and_desktop_listener() {
+    for web in [true, false] {
+        let server = MockServer::start().await;
+        let (service, _, _db) = setup(&server).await;
+        let first = service.start_browser_authorization(USER, req(web), None).await.unwrap();
+        let original = params(&first.authorization);
+        token_mock(&server).await;
+        service
+            .complete_browser_authorization(
+                USER,
+                complete(&first.authorization, CODE, &original["state"]),
+                first.binding_cookie.as_deref(),
+            )
+            .await
+            .unwrap();
+        Mock::given(method("GET"))
+            .and(path("/api/workbench/account"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({"success":false,"code":"device_revoked"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(matches!(
+            service.account(USER).await,
+            Err(TokenBitsError::DeviceRevoked)
+        ));
+        assert!(service.status(USER).await.unwrap().needs_reauthorization);
+        // The original binding cookie has already been cleared by the browser.
+        let renewed = service.start_browser_authorization(USER, req(web), None).await.unwrap();
+        let next = params(&renewed.authorization);
+        assert_ne!(first.authorization.flow_id, renewed.authorization.flow_id);
+        assert_ne!(original["state"], next["state"]);
+        assert_ne!(original["code_challenge"], next["code_challenge"]);
+        assert!(
+            renewed.listener_shutdown.is_some(),
+            "new desktop flow must get a listener lifetime"
+        );
+        if web {
+            assert_ne!(first.binding_cookie, renewed.binding_cookie);
+            assert!(renewed.binding_cookie.is_some());
+        }
+        assert_eq!(
+            service
+                .browser_authorization_status(USER, &renewed.authorization.flow_id)
+                .await
+                .unwrap()
+                .status,
+            "pending"
+        );
+        assert!(matches!(
+            service
+                .browser_authorization_status(USER, &first.authorization.flow_id)
+                .await,
+            Err(TokenBitsError::NotFound)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn revoked_browser_connection_does_not_block_explicit_legacy_reauthorization() {
+    let server = MockServer::start().await;
+    let (service, _, _db) = setup(&server).await;
+    let flow = service
+        .start_browser_authorization(USER, req(true), None)
+        .await
+        .unwrap();
+    token_mock(&server).await;
+    service
+        .complete_browser_authorization(
+            USER,
+            complete(&flow.authorization, CODE, &params(&flow.authorization)["state"]),
+            flow.binding_cookie.as_deref(),
+        )
+        .await
+        .unwrap();
+    Mock::given(method("GET"))
+        .and(path("/api/workbench/account"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({"success":false,"code":"device_revoked"})))
+        .mount(&server)
+        .await;
+    assert!(matches!(
+        service.account(USER).await,
+        Err(TokenBitsError::DeviceRevoked)
+    ));
+    Mock::given(method("POST")).and(path("/api/workbench/authorizations")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"success":true,"data":{"device_code":"legacy-device","user_code":"ABCD","verification_uri":format!("{}/aionui/authorize",server.uri()),"verification_uri_complete":format!("{}/aionui/authorize?user_code=ABCD",server.uri()),"expires_in":600,"interval":5}}))).expect(1).mount(&server).await;
+    assert!(
+        service
+            .authorize(
+                USER,
+                TokenBitsAuthorizeRequest {
+                    client_id: "aionui-web".into(),
+                    device_name: "Legacy retry".into()
+                }
+            )
+            .await
+            .is_ok()
+    );
+    assert!(matches!(
+        service
+            .browser_authorization_status(USER, &flow.authorization.flow_id)
+            .await,
+        Err(TokenBitsError::NotFound)
+    ));
+}
