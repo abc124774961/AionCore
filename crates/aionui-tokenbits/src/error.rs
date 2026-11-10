@@ -4,6 +4,8 @@ pub enum TokenBitsError {
     InvalidRequest,
     #[error("TokenBits authorization belongs to another browser")]
     BrowserBinding,
+    #[error("TokenBits account does not match this hosted workspace")]
+    AccountBinding,
     #[error("TokenBits authorization not found")]
     NotFound,
     #[error("Reconnect your TokenBits account")]

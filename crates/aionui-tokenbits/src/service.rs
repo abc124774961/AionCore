@@ -1,7 +1,7 @@
 use crate::{client::TokenBitsClient, error::TokenBitsError};
 use aionui_api_types::tokenbits::*;
 use aionui_common::{decrypt_string, encrypt_string};
-use aionui_db::{ITokenBitsRepository, ManagedProviderInput};
+use aionui_db::{ITokenBitsRepository, IUserRepository, ManagedProviderInput, UserStatus, UserType};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,8 @@ struct StoredAccount {
     account: Option<TokenBitsAccountIdentity>,
     last_sync_at: Option<i64>,
     needs_reauthorization: bool,
+    #[serde(default)]
+    hosted_import_hash: Option<String>,
 }
 
 struct PendingAuthorization {
@@ -93,6 +95,12 @@ pub struct TokenBitsService {
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pending: Mutex<HashMap<String, PendingAuthorization>>,
     browser_pending: Mutex<HashMap<String, PendingBrowserAuthorization>>,
+    hosted_account: Option<HostedAccountBinding>,
+}
+
+struct HostedAccountBinding {
+    account_id: i64,
+    users: Arc<dyn IUserRepository>,
 }
 
 impl TokenBitsService {
@@ -104,7 +112,141 @@ impl TokenBitsService {
             locks: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             browser_pending: Mutex::new(HashMap::new()),
+            hosted_account: None,
         }
+    }
+
+    /// The composition root supplies the tenant identity; browser requests cannot change it.
+    pub fn with_hosted_account(mut self, account_id: i64, users: Arc<dyn IUserRepository>) -> Result<Self> {
+        if account_id <= 0 {
+            return Err(TokenBitsError::InvalidRequest);
+        }
+        self.hosted_account = Some(HostedAccountBinding { account_id, users });
+        Ok(self)
+    }
+
+    pub fn has_hosted_account(&self) -> bool {
+        self.hosted_account.is_some()
+    }
+
+    fn hosted_external_id(&self, account_id: i64) -> String {
+        format!(
+            "tokenbits:{:x}:{account_id}",
+            Sha256::digest(self.client.issuer().as_bytes())
+        )
+    }
+
+    async fn verify_hosted_user(&self, user: &str) -> Result<()> {
+        if let Some(binding) = &self.hosted_account {
+            let row = binding
+                .users
+                .find_active_by_id(user)
+                .await?
+                .ok_or(TokenBitsError::AccountBinding)?;
+            if row.user_type != UserType::Aionpro
+                || row.external_user_id.as_deref() != Some(self.hosted_external_id(binding.account_id).as_str())
+            {
+                return Err(TokenBitsError::AccountBinding);
+            }
+        }
+        Ok(())
+    }
+
+    async fn verified_hosted_account(&self, user: &str, token: &str) -> Result<Option<TokenBitsAccountIdentity>> {
+        let Some(binding) = &self.hosted_account else {
+            return Ok(None);
+        };
+        self.verify_hosted_user(user).await?;
+        let account: TokenBitsAccount = self.client.request(Method::GET, "/account", Some(token), None).await?;
+        self.client.validate_url(&account.topup_url)?;
+        if account.account.id != binding.account_id {
+            return Err(TokenBitsError::AccountBinding);
+        }
+        Ok(Some(account.account))
+    }
+
+    /// Import only into the pre-provisioned tenant after verifying the issuer's real account.
+    /// Existing usable credentials win, including after a response-loss retry or rotation.
+    pub async fn attach_hosted(&self, req: TokenBitsHostedAttachRequest) -> Result<TokenBitsHostedAttachResponse> {
+        let binding = self.hosted_account.as_ref().ok_or(TokenBitsError::AccountBinding)?;
+        if req.client_id != "aionui-web" || req.external_user_id != self.hosted_external_id(binding.account_id) {
+            return Err(TokenBitsError::AccountBinding);
+        }
+        let token = RemoteToken {
+            access_token: req.access_token,
+            refresh_token: req.refresh_token,
+            expires_in: req.expires_in,
+            device_id: req.device_id,
+        };
+        validate_token(&token).map_err(|_| TokenBitsError::InvalidRequest)?;
+        if [&token.access_token, &token.refresh_token]
+            .iter()
+            .any(|value| value.len() > 4096 || value.chars().any(char::is_whitespace))
+        {
+            return Err(TokenBitsError::InvalidRequest);
+        }
+        let user = binding
+            .users
+            .find_by_external_user_id(UserType::Aionpro, &req.external_user_id)
+            .await?
+            .filter(|user| user.status == UserStatus::Active)
+            .ok_or(TokenBitsError::AccountBinding)?;
+        let lock = self.lock(&user.id).await;
+        let _guard = lock.lock().await;
+        let import_hash = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(
+                    &req.client_id,
+                    &token.access_token,
+                    &token.refresh_token,
+                    token.device_id
+                ))
+                .map_err(|_| TokenBitsError::Storage)?
+            )
+        );
+        if self.load(&user.id).await?.is_some() {
+            match self.access(&user.id).await {
+                Ok(existing) => {
+                    let imported = existing.device_id == token.device_id;
+                    if !imported || existing.hosted_import_hash.as_deref() != Some(import_hash.as_str()) {
+                        self.verified_hosted_account(&user.id, &token.access_token).await?;
+                    }
+                    tracing::info!(user_id = %user.id, imported, "TokenBits hosted connection retained");
+                    return Ok(TokenBitsHostedAttachResponse {
+                        imported,
+                        status: self.status(&user.id).await?,
+                    });
+                }
+                Err(TokenBitsError::Reauthorization) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let account = self.verified_hosted_account(&user.id, &token.access_token).await?;
+        let state = StoredAccount {
+            issuer: self.client.issuer(),
+            client_id: req.client_id,
+            access_token: token.access_token,
+            refresh_token: token.refresh_token,
+            device_id: token.device_id,
+            expires_at: now() + token.expires_in,
+            exchange_id: random_secret()?,
+            account,
+            last_sync_at: None,
+            needs_reauthorization: false,
+            hosted_import_hash: Some(import_hash),
+        };
+        self.repo.disable_providers(&user.id).await?;
+        self.save(&user.id, &state).await?;
+        self.pending.lock().await.remove(&user.id);
+        if let Some(flow) = self.browser_pending.lock().await.remove(&user.id) {
+            let _ = flow.close_listener.send(true);
+        }
+        tracing::info!(user_id = %user.id, account_id = binding.account_id, "TokenBits hosted connection imported");
+        Ok(TokenBitsHostedAttachResponse {
+            imported: true,
+            status: self.status(&user.id).await?,
+        })
     }
 
     async fn lock(&self, user: &str) -> Arc<Mutex<()>> {
@@ -148,6 +290,7 @@ impl TokenBitsService {
     }
 
     pub async fn authorize(&self, user: &str, req: TokenBitsAuthorizeRequest) -> Result<TokenBitsAuthorization> {
+        self.verify_hosted_user(user).await?;
         if !matches!(req.client_id.as_str(), "aionui-desktop" | "aionui-web")
             || req.device_name.trim().is_empty()
             || req.device_name.len() > 128
@@ -219,6 +362,7 @@ impl TokenBitsService {
         req: TokenBitsBrowserAuthorizeRequest,
         browser_cookie: Option<&str>,
     ) -> Result<BrowserAuthorizationStart> {
+        self.verify_hosted_user(user).await?;
         if !matches!(req.client_id.as_str(), "aionui-desktop" | "aionui-web")
             || req.device_name.trim().is_empty()
             || req.device_name.len() > 128
@@ -396,6 +540,7 @@ impl TokenBitsService {
             )
             .await?;
         validate_token(&token)?;
+        let account_identity = self.verified_hosted_account(user, &token.access_token).await?;
         let account = StoredAccount {
             issuer: self.client.issuer(),
             client_id,
@@ -404,9 +549,10 @@ impl TokenBitsService {
             device_id: token.device_id,
             expires_at: now() + token.expires_in,
             exchange_id: random_secret()?,
-            account: None,
+            account: account_identity,
             last_sync_at: None,
             needs_reauthorization: false,
+            hosted_import_hash: None,
         };
         self.save(user, &account).await?;
         let mut pending = self.browser_pending.lock().await;
@@ -478,6 +624,7 @@ impl TokenBitsService {
         {
             Ok(token) => {
                 validate_token(&token)?;
+                let account_identity = self.verified_hosted_account(user, &token.access_token).await?;
                 let state = StoredAccount {
                     issuer: self.client.issuer(),
                     client_id,
@@ -486,9 +633,10 @@ impl TokenBitsService {
                     device_id: token.device_id,
                     expires_at: now() + token.expires_in,
                     exchange_id: random_secret()?,
-                    account: None,
+                    account: account_identity,
                     last_sync_at: None,
                     needs_reauthorization: false,
+                    hosted_import_hash: None,
                 };
                 self.save(user, &state).await?;
                 self.pending.lock().await.remove(user);
@@ -519,12 +667,23 @@ impl TokenBitsService {
     /// Call only with the per-user lock held. The persisted exchange identity is
     /// reused after transport/storage failure, including after a process restart.
     async fn access(&self, user: &str) -> Result<StoredAccount> {
+        self.verify_hosted_user(user).await?;
         let mut state = self.load(user).await?.ok_or(TokenBitsError::Reauthorization)?;
         if state.needs_reauthorization || state.issuer != self.client.issuer() {
             self.repo.disable_providers(user).await?;
             return Err(TokenBitsError::Reauthorization);
         }
         if state.expires_at > now() + 60 {
+            if let Some(binding) = &self.hosted_account {
+                match &state.account {
+                    Some(account) if account.id == binding.account_id => {}
+                    Some(_) => return Err(TokenBitsError::AccountBinding),
+                    None => {
+                        state.account = self.verified_hosted_account(user, &state.access_token).await?;
+                        self.save(user, &state).await?;
+                    }
+                }
+            }
             return Ok(state);
         }
         let token = self.client.request::<RemoteToken>(Method::POST, "/token", None, Some(json!({
@@ -535,6 +694,9 @@ impl TokenBitsService {
                 validate_token(&token)?;
                 if token.device_id != state.device_id {
                     return Err(TokenBitsError::Unavailable);
+                }
+                if let Some(account) = self.verified_hosted_account(user, &token.access_token).await? {
+                    state.account = Some(account);
                 }
                 state.access_token = token.access_token;
                 state.refresh_token = token.refresh_token;
@@ -583,6 +745,14 @@ impl TokenBitsService {
             .await;
         let account = self.handle_remote(user, result).await?;
         self.client.validate_url(&account.topup_url)?;
+        self.verify_hosted_user(user).await?;
+        if self
+            .hosted_account
+            .as_ref()
+            .is_some_and(|binding| account.account.id != binding.account_id)
+        {
+            return Err(TokenBitsError::AccountBinding);
+        }
         state.account = Some(account.account.clone());
         self.save(user, &state).await?;
         Ok(account)

@@ -450,6 +450,23 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
             csrf_middleware,
         ))
     }
+    .merge(
+        if services.identity_mode == crate::config::IdentityMode::AionPro
+            && services.tokenbits_service.has_hosted_account()
+        {
+            match services.bootstrap_secret.clone() {
+                Some(bootstrap_secret) => {
+                    aionui_tokenbits::routes::hosted_routes(aionui_tokenbits::state::TokenBitsHostedRouterState {
+                        service: services.tokenbits_service.clone(),
+                        bootstrap_secret,
+                    })
+                }
+                None => Router::new(),
+            }
+        } else {
+            Router::new()
+        },
+    )
     .merge(ws_routes)
     .merge(runtime_team_tools)
     .merge(session_message_runtime)

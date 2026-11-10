@@ -258,11 +258,23 @@ impl AppServices {
             Err(_) => aionui_tokenbits::client::TokenBitsClient::new(&tokenbits_issuer),
         }
         .map_err(|_| anyhow::anyhow!("Invalid TokenBits issuer configuration"))?;
-        let tokenbits_service = Arc::new(aionui_tokenbits::service::TokenBitsService::new(
+        let mut tokenbits_service = aionui_tokenbits::service::TokenBitsService::new(
             Arc::new(aionui_db::SqliteTokenBitsRepository::new(database.pool().clone())),
             encryption_key,
             tokenbits_client,
-        ));
+        );
+        if let Ok(value) = std::env::var("AIONUI_TOKENBITS_EXPECTED_USER_ID") {
+            let account_id = value
+                .parse::<i64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .ok_or_else(|| anyhow::anyhow!("Invalid hosted TokenBits account configuration"))?;
+            if identity_mode != IdentityMode::AionPro || config.bootstrap_secret.as_ref().is_none_or(|s| s.len() < 32) {
+                anyhow::bail!("Hosted TokenBits requires AionPro identity and a bootstrap secret of at least 32 bytes");
+            }
+            tokenbits_service = tokenbits_service.with_hosted_account(account_id, user_repo.clone())?;
+        }
+        let tokenbits_service = Arc::new(tokenbits_service);
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let event_bus = Arc::new(BroadcastEventBus::new(256));
         // User-configured MCP servers — injected into ACP `session/new`
