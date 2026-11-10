@@ -144,16 +144,18 @@ pub struct BedrockConfig {
 
 /// Provider response for `GET /api/providers` and single-provider endpoints.
 ///
-/// The `api_key` field is returned in plaintext (decrypted on read). Storage
-/// remains encrypted at rest. Pre-launch convention for the frontend
-/// local-store → backend migration; no masking applied.
+/// Manual provider `api_key` values retain the existing plaintext read contract.
+/// Managed TokenBits keys are always returned as an empty string. Storage is
+/// encrypted at rest in both cases.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderResponse {
+    #[serde(default = "manual_credential_source")]
+    pub credential_source: String,
     pub id: String,
     pub platform: String,
     pub name: String,
     pub base_url: String,
-    /// Plaintext API key (decrypted from storage).
+    /// Manual API key; empty for integration-managed credentials.
     pub api_key: String,
     pub models: Vec<String>,
     pub enabled: bool,
@@ -487,6 +489,7 @@ mod tests {
     #[test]
     fn test_provider_response_serialization() {
         let resp = ProviderResponse {
+            credential_source: "manual".into(),
             id: "uuid-xxx".into(),
             platform: "anthropic".into(),
             name: "Anthropic".into(),
@@ -524,6 +527,7 @@ mod tests {
     fn test_provider_response_api_key_plaintext() {
         // Pre-launch: no masking is applied to the api_key field on the wire.
         let resp = ProviderResponse {
+            credential_source: "manual".into(),
             id: "id".into(),
             platform: "openai".into(),
             name: "n".into(),
@@ -994,4 +998,8 @@ mod tests {
         assert_eq!(json["http_status"], 401);
         assert!(json.get("timeout_stage").is_none());
     }
+}
+
+fn manual_credential_source() -> String {
+    "manual".into()
 }

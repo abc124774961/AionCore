@@ -14,6 +14,7 @@ pub struct Provider {
     pub name: String,
     pub base_url: String,
     pub api_key_encrypted: String,
+    pub credential_source: String,
     /// JSON array of model ID strings.
     pub models: String,
     pub enabled: bool,

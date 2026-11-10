@@ -425,6 +425,7 @@ dependencies = [
  "aionui-system",
  "aionui-team",
  "aionui-team-prompts",
+ "aionui-tokenbits",
  "anyhow",
  "async-trait",
  "axum",
@@ -1048,6 +1049,31 @@ dependencies = [
  "aionui-api-types",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "aionui-tokenbits"
+version = "0.2.2"
+dependencies = [
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-db",
+ "axum",
+ "base64",
+ "getrandom 0.2.17",
+ "http-body-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "subtle",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]

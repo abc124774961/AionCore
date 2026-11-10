@@ -240,3 +240,5 @@ mod public_contract_tests {
         assert_eq!(resolution.target, Some(AgentErrorResolutionTarget::Feedback));
     }
 }
+
+pub mod tokenbits;

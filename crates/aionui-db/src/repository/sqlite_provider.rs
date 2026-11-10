@@ -80,6 +80,7 @@ impl IProviderRepository for SqliteProviderRepository {
         })?;
 
         Ok(Provider {
+            credential_source: "manual".into(),
             id,
             user_id: params.user_id.to_string(),
             platform: params.platform.to_string(),
@@ -164,6 +165,7 @@ fn is_unique_violation(err: &dyn sqlx::error::DatabaseError) -> bool {
 fn merge_update(existing: Provider, params: UpdateProviderParams<'_>) -> Provider {
     let now = aionui_common::now_ms();
     Provider {
+        credential_source: existing.credential_source,
         id: existing.id,
         user_id: existing.user_id,
         platform: params.platform.unwrap_or(&existing.platform).to_string(),

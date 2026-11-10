@@ -68,8 +68,21 @@ impl ProviderHealthCheckService {
     }
 
     fn resolve_probe_config(&self, row: &Provider, model_id: &str) -> Result<AionrsResolvedConfig, AgentError> {
+        if row.credential_source == "tokenbits" && !row.enabled {
+            return Err(AgentError::bad_request(
+                "TokenBits connection is disabled; reconnect before use",
+            ));
+        }
+
         let api_key = aionui_common::decrypt_string(&row.api_key_encrypted, &self.encryption_key)
             .map_err(|e| AgentError::internal(e.to_string()))?;
+        if row.credential_source == "tokenbits" {
+            let models: Vec<String> =
+                serde_json::from_str(&row.models).map_err(|_| AgentError::bad_request("Invalid managed model"))?;
+            if !models.iter().any(|m| m == model_id) {
+                return Err(AgentError::bad_request("Model is outside TokenBits connection"));
+            }
+        }
         let provider = map_aionrs_provider(&row.platform, model_id, row.model_protocols.as_deref())?;
         let model_overrides = resolve_model_compat_overrides(model_id, &row.model_settings)?;
         let (base_url, mut compat_overrides) = resolve_aionrs_url_and_compat_with_mode(
@@ -381,6 +394,7 @@ mod tests {
 
     fn test_provider() -> Provider {
         Provider {
+            credential_source: "manual".into(),
             id: "provider-1".to_owned(),
             user_id: TEST_USER_ID.to_owned(),
             platform: "anthropic".to_owned(),

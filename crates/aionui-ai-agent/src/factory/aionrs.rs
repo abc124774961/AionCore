@@ -131,6 +131,12 @@ pub(super) async fn build(
         .map_err(|e| AgentError::internal(format!("Failed to load provider config: {e}")))?
         .ok_or_else(|| AgentError::bad_request(format!("Provider '{provider_id}' not found")))?;
 
+    if row.credential_source == "tokenbits" && !row.enabled {
+        return Err(AgentError::bad_request(
+            "TokenBits connection is disabled; reconnect before use",
+        ));
+    }
+
     let api_key = aionui_common::decrypt_string(&row.api_key_encrypted, &deps.encryption_key)
         .map_err(|e| AgentError::internal(e.to_string()))?;
 
@@ -141,6 +147,13 @@ pub(super) async fn build(
         .unwrap_or(&model.model)
         .to_owned();
 
+    if row.credential_source == "tokenbits" {
+        let models: Vec<String> =
+            serde_json::from_str(&row.models).map_err(|_| AgentError::bad_request("Invalid managed model"))?;
+        if !models.contains(&model_id) {
+            return Err(AgentError::bad_request("Model is outside TokenBits connection"));
+        }
+    }
     let provider = map_aionrs_provider(&row.platform, &model_id, row.model_protocols.as_deref())?;
     let model_overrides = resolve_model_compat_overrides(&model_id, &row.model_settings)?;
 
@@ -234,7 +247,39 @@ pub(super) async fn build(
         }
     }
 
-    let agent = AionrsAgentManager::new(ctx.conversation_id, ctx.workspace, config, resume_session).await?;
+    let managed_guard = if row.credential_source == "tokenbits" {
+        let repo = deps.provider_repo.clone();
+        let user_id = ctx.user_id.clone();
+        let provider_id = row.id.clone();
+        let model_id = config.model.clone();
+        Some(Arc::new(move || {
+            let repo = repo.clone();
+            let user_id = user_id.clone();
+            let provider_id = provider_id.clone();
+            let model_id = model_id.clone();
+            Box::pin(async move {
+                let current = repo
+                    .find_by_id(&user_id, &provider_id)
+                    .await
+                    .map_err(|_| AgentError::internal("Provider storage unavailable"))?
+                    .ok_or_else(|| AgentError::bad_request("TokenBits provider no longer exists"))?;
+                let models: Vec<String> = serde_json::from_str(&current.models)
+                    .map_err(|_| AgentError::bad_request("Invalid managed model"))?;
+                if !current.enabled || current.credential_source != "tokenbits" || !models.contains(&model_id) {
+                    return Err(AgentError::bad_request(
+                        "TokenBits connection is disabled; reconnect before use",
+                    ));
+                }
+                Ok(())
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AgentError>> + Send>>
+        }))
+    } else {
+        None
+    };
+    let mut agent = AionrsAgentManager::new(ctx.conversation_id, ctx.workspace, config, resume_session).await?;
+    if let Some(guard) = managed_guard {
+        agent = agent.with_managed_provider_guard(guard);
+    }
     Ok(AgentInstance::Aionrs(Arc::new(agent)))
 }
 

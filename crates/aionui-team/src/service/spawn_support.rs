@@ -657,6 +657,7 @@ mod tests {
 
     fn provider_row(id: &str, models: &[&str]) -> Provider {
         Provider {
+            credential_source: "manual".into(),
             id: id.into(),
             user_id: "user1".into(),
             platform: "openai".into(),

@@ -69,6 +69,7 @@ pub struct AppServices {
     /// key for at-rest credentials. Decoupled from the JWT signing secret held
     /// by `jwt_service`, so signing can rotate without changing the key.
     pub encryption_secret_raw: String,
+    pub tokenbits_service: Arc<aionui_tokenbits::service::TokenBitsService>,
     pub data_dir: PathBuf,
     pub dump_prompts: bool,
     pub work_dir: PathBuf,
@@ -250,6 +251,15 @@ impl AppServices {
 
         let encryption_key = derive_encryption_key(&encryption_secret);
 
+        let tokenbits_issuer = std::env::var("AIONUI_TOKENBITS_ISSUER")
+            .unwrap_or_else(|_| aionui_tokenbits::client::DEFAULT_ISSUER.into());
+        let tokenbits_client = aionui_tokenbits::client::TokenBitsClient::new(&tokenbits_issuer)
+            .map_err(|_| anyhow::anyhow!("Invalid TokenBits issuer configuration"))?;
+        let tokenbits_service = Arc::new(aionui_tokenbits::service::TokenBitsService::new(
+            Arc::new(aionui_db::SqliteTokenBitsRepository::new(database.pool().clone())),
+            encryption_key,
+            tokenbits_client,
+        ));
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let event_bus = Arc::new(BroadcastEventBus::new(256));
         // User-configured MCP servers — injected into ACP `session/new`
@@ -448,6 +458,7 @@ impl AppServices {
             conversation_repo,
             acp_session_sync: acp_agent_service,
             encryption_secret_raw: encryption_secret,
+            tokenbits_service,
             data_dir,
             dump_prompts,
             work_dir,

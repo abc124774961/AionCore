@@ -97,6 +97,11 @@ impl ModelFetchService {
             .await?
             .ok_or_else(|| SystemError::NotFound(format!("Provider {provider_id} not found")))?;
 
+        if row.credential_source == "tokenbits" {
+            return Err(SystemError::Conflict(
+                "Use TokenBits catalog synchronization for managed models".into(),
+            ));
+        }
         let api_key = decrypt_string(&row.api_key_encrypted, &self.encryption_key)?;
         if api_key.trim().is_empty() {
             return Err(SystemError::BadRequest("API key is empty".into()));
