@@ -1,5 +1,8 @@
 #![allow(clippy::disallowed_types)]
-use crate::{error::TokenBitsError, state::TokenBitsRouterState};
+use crate::{
+    error::TokenBitsError,
+    state::{TokenBitsHostedRouterState, TokenBitsRouterState},
+};
 use aionui_api_types::{ApiResponse, tokenbits::*};
 use aionui_auth::{CurrentUser, RateLimiter, authenticated_action_rate_limit_middleware};
 use aionui_common::ApiError;
@@ -19,6 +22,7 @@ impl From<TokenBitsError> for ApiError {
         let (status, code) = match &error {
             TokenBitsError::InvalidRequest => (StatusCode::BAD_REQUEST, "TOKENBITS_INVALID_REQUEST"),
             TokenBitsError::BrowserBinding => (StatusCode::FORBIDDEN, "TOKENBITS_BROWSER_BINDING"),
+            TokenBitsError::AccountBinding => (StatusCode::FORBIDDEN, "TOKENBITS_ACCOUNT_BINDING"),
             TokenBitsError::NotFound => (StatusCode::NOT_FOUND, "TOKENBITS_NOT_FOUND"),
             TokenBitsError::Reauthorization => (StatusCode::CONFLICT, "TOKENBITS_REAUTHORIZE"),
             TokenBitsError::DeviceRevoked => (StatusCode::CONFLICT, "TOKENBITS_REAUTHORIZE"),
@@ -29,6 +33,53 @@ impl From<TokenBitsError> for ApiError {
         };
         ApiError::coded(status, code, error.to_string(), None)
     }
+}
+
+/// Private service-to-service boundary; ambient browser credentials never authorize it.
+/// The composition root registers it only for a configured hosted tenant, outside cookie CSRF.
+pub fn hosted_routes(state: TokenBitsHostedRouterState) -> Router {
+    let limiter = Arc::new(RateLimiter::new(30, Duration::from_secs(60)));
+    limiter.start_cleanup_task(Duration::from_secs(60));
+    Router::new()
+        .route("/api/integrations/tokenbits/internal/attach", post(hosted_attach))
+        .route_layer(middleware::from_fn_with_state(
+            limiter,
+            aionui_auth::api_rate_limit_middleware,
+        ))
+        .with_state(state)
+        .layer(middleware::from_fn(no_store))
+}
+
+async fn hosted_attach(
+    State(state): State<TokenBitsHostedRouterState>,
+    headers: HeaderMap,
+    body: Result<Json<TokenBitsHostedAttachRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<TokenBitsHostedAttachResponse>>, ApiError> {
+    let provided = headers
+        .get("x-aioncore-bootstrap-secret")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if state.bootstrap_secret.len() < 32 || !bool::from(state.bootstrap_secret.as_bytes().ct_eq(provided.as_bytes())) {
+        return Err(ApiError::coded(
+            StatusCode::UNAUTHORIZED,
+            "INVALID_BOOTSTRAP_SECRET",
+            "Internal authentication required",
+            None,
+        ));
+    }
+    if ["origin", "cookie", "sec-fetch-mode"]
+        .iter()
+        .any(|name| headers.contains_key(*name))
+    {
+        return Err(ApiError::coded(
+            StatusCode::FORBIDDEN,
+            "TOKENBITS_INTERNAL_ONLY",
+            "Browser requests are not supported",
+            None,
+        ));
+    }
+    let Json(req) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(state.service.attach_hosted(req).await?)))
 }
 
 /// The composition root wraps this router in Core authentication and Web CSRF.

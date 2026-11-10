@@ -7,3 +7,9 @@ pub struct TokenBitsRouterState {
     pub local: bool,
     pub local_secret: Option<String>,
 }
+
+#[derive(Clone)]
+pub struct TokenBitsHostedRouterState {
+    pub service: Arc<TokenBitsService>,
+    pub bootstrap_secret: Arc<str>,
+}

@@ -104,6 +104,55 @@ protect the full data directory. Full untrusted multi-user execution isolation
 requires separate Core/container/OS boundaries; user-scoped records alone do not
 sandbox file access or agent execution.
 
+## Hosted Web broker attachment
+
+Hosted execution uses a separate Core/container and private data volume per TokenBits
+account. Start Core with `--identity-mode aionpro`, a unique
+`AIONCORE_BOOTSTRAP_SECRET` of at least 32 bytes, a stable per-instance
+`AIONUI_ENCRYPTION_SECRET`, and the positive numeric
+`AIONUI_TOKENBITS_EXPECTED_USER_ID`. Keep `AIONUI_TOKENBITS_ISSUER` fixed at startup
+(official issuer: `https://api.tokenbits.net`). Never use `--local` or share the
+default admin account. The regular standalone Web CLI is not a multi-tenant broker.
+
+After exchanging the existing browser authorization code, the trusted broker reads
+`GET /api/workbench/account` with that access token. It identifies the tenant as
+`tokenbits:<lowercase SHA-256 hex of canonical issuer origin without trailing slash>:<decimal account.id>`.
+It provisions that identity using the existing internal external-user endpoint with
+`user_type: "aionpro"`, then calls:
+
+```http
+POST /api/integrations/tokenbits/internal/attach
+Content-Type: application/json
+X-Aioncore-Bootstrap-Secret: <instance bootstrap secret>
+
+{"external_user_id":"<tenant identity>","client_id":"aionui-web","access_token":"<access token>","refresh_token":"<refresh token>","device_id":7,"expires_in":900}
+```
+
+This endpoint is registered only for a configured hosted instance. It rejects
+browser `Origin`, `Cookie` and `Sec-Fetch-Mode` headers; session/helper tokens cannot
+authorize it. It uses explicit bootstrap authentication instead of ambient-cookie
+CSRF. The public broker must not forward this internal route or bootstrap header.
+Core independently obtains the incoming token's account from its fixed issuer,
+checks the expected numeric account and the active external Core user, then reuses
+encrypted credential storage. The same account constraint also applies to browser
+and device authorization completion, account reads and refresh rotation.
+
+The response is `{"success":true,"data":{"imported":true,"status":{...}}}`,
+where `status` is the ordinary secret-free TokenBits status. `imported: true` means
+the incoming device is retained (including a same-device retry after rotation);
+`imported: false` means an existing usable device remains active, so the broker
+must revoke the unused incoming grant. Existing refresh credentials are never
+overwritten by a retry. An explicitly disconnected account may be imported again
+when the user actively enters the hosted workbench; passive status calls do not
+reconnect. Failed account checks preserve the stored connection. The broker must
+handle the device cleanup idempotently and must not revoke a retained device.
+
+The broker can then use the existing external-session endpoint to obtain the
+tenant's Core session, route authenticated API/WebSocket traffic to that exact
+container, and render the unchanged AionUi interface. A freshly created tenant
+must use a new empty volume: first-external-user adoption deliberately imports
+legacy local data and is unsuitable for an operator's existing data directory.
+
 ## macOS arm64 desktop bundle
 
 Build this source with the pinned Rust toolchain:

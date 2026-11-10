@@ -67,6 +67,25 @@ pub struct TokenBitsBrowserCompleteRequest {
     pub state: String,
 }
 
+/// Server-to-server import of a browser grant already exchanged by the hosted broker.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenBitsHostedAttachRequest {
+    pub external_user_id: String,
+    pub client_id: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub device_id: i64,
+    pub expires_in: i64,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct TokenBitsHostedAttachResponse {
+    /// False means an existing device remains in use; revoke the unused incoming device.
+    pub imported: bool,
+    pub status: TokenBitsStatus,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TokenBitsSyncRequest {
